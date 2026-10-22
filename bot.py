@@ -24,6 +24,9 @@ SEND_GAP = 2  # seconds between forwards (flood safety)
 BACKFILL = os.environ.get("BACKFILL") == "1"
 BACKFILL_LIMIT = int(os.environ.get("BACKFILL_LIMIT", "40"))  # per channel
 BACKFILL_MIN_ID = int(os.environ.get("BACKFILL_MIN_ID", "0"))  # 0 = no floor
+# One-time archive sweep: every file name already in the target becomes an
+# "f:" sent-key, so a repost of an old file by any channel is caught.
+SEED_LIMIT = 4000
 
 
 def fa_digits(value):
@@ -134,6 +137,43 @@ def media_key(handle, msg):
     return f"{handle}#{msg.id}"
 
 
+def filename_of(msg):
+    """Original upload name, e.g. 'Track 12.mp3'. Empty when there is none."""
+    file = getattr(msg, "file", None)
+    return (getattr(file, "name", "") or "").strip()
+
+
+def name_key(name):
+    """File-name identity for reposts: case- and spacing-insensitive.
+
+    'Track One.MP3' == 'track one .mp3' == 'TrackOne.mp3'. Prefixed 'f:' so it
+    can never collide with a 'handle#id' key.
+    """
+    return "f:" + "".join(name.lower().split())
+
+
+async def seed_sent_names(client, target, state):
+    """One-time: every file name the archive already holds becomes an "f:"
+    sent-key, so reposts of anything forwarded before this guard existed are
+    skipped from the first run on.
+
+    ponytail: whole-archive scan capped at SEED_LIMIT; raise it when the
+    archive outgrows 4000 posts.
+    """
+    sent = state.setdefault("sent", {})
+    if any(k.startswith("f:") for k in sent):
+        return 0
+    added = 0
+    async for msg in client.iter_messages(target, limit=SEED_LIMIT):
+        fname = filename_of(msg)
+        if fname:
+            sent[name_key(fname)] = 1
+            added += 1
+    if added:
+        print(f"🔁 seeded {added} existing archive file name(s)")
+    return added
+
+
 async def main():
     session = os.environ.get("TELEGRAM_SESSION", "")
     api_id = os.environ.get("TELETHON_API_ID", "")
@@ -159,7 +199,15 @@ async def main():
     print(f"target: {target}")
 
     state = load_state()
-    forwarded = failed = 0
+    forwarded = failed = dupes = 0
+
+    # One sweep over what the archive already holds: state["sent"] predates
+    # name keys, so without this every pre-change file would forward again.
+    # Failure is non-fatal — dedupe then builds from this run's sends.
+    try:
+        await seed_sent_names(client, target, state)
+    except Exception as e:
+        print(f"⚠️ archive name-seed failed: {type(e).__name__}, continuing")
 
     for handle, name in load_channels():
         try:
@@ -206,7 +254,9 @@ async def main():
                         if long_media(msg) is None:
                             continue
                         key = media_key(handle, msg)
-                        if already_sent(state, key):
+                        fname = filename_of(msg)
+                        if already_sent(state, key) or (
+                                fname and already_sent(state, name_key(fname))):
                             # Already in the target channel: skip, but keep walking.
                             continue
                         await client.send_file(
@@ -214,6 +264,8 @@ async def main():
                             caption=format_caption(name),
                         )
                         remember_sent(state, key)
+                        if fname:
+                            remember_sent(state, name_key(fname))
                         sent += 1
                         stamp = clock(audio_duration(msg))
                         print(f"⬅️ {name} — {stamp} (id={msg.id})")
@@ -251,9 +303,15 @@ async def main():
                         # Nothing to send — safe to move the cursor past this post.
                         state["channels"][handle] = max(state["channels"][handle], msg.id)
                         continue
-                    if already_sent(state, media_key(handle, msg)):
-                        # Replay of an already-forwarded file: no second send, but the
+                    fname = filename_of(msg)
+                    id_dup = already_sent(state, media_key(handle, msg))
+                    name_dup = bool(fname) and already_sent(state, name_key(fname))
+                    if id_dup or name_dup:
+                        # Replay of an already-forwarded file, or a repost of one
+                        # another channel sent earlier: no second send, but the
                         # cursor still advances so this range is not re-read.
+                        if name_dup:
+                            dupes += 1
                         state["channels"][handle] = max(state["channels"][handle], msg.id)
                         continue
                     # Sending the media reference copies server-side: no download,
@@ -263,6 +321,8 @@ async def main():
                         caption=format_caption(name),
                     )
                     remember_sent(state, media_key(handle, msg))
+                    if fname:
+                        remember_sent(state, name_key(fname))
                     # Cursor advances only after a confirmed send, so a failure
                     # retries this post on the next run instead of losing it.
                     state["channels"][handle] = max(state["channels"][handle], msg.id)
@@ -289,7 +349,7 @@ async def main():
     (HERE / "state.json").write_text(
         json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    print(f"forwarded={forwarded} failed={failed}")
+    print(f"forwarded={forwarded} failed={failed} dupes={dupes}")
     await client.disconnect()
 
     # GitHub only greys a run green or red on the exit code. Returning 0 while

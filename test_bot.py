@@ -10,6 +10,7 @@ import inspect
 import json
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from telethon import utils
 from telethon.tl.types import (
@@ -35,11 +36,12 @@ def fake_audio_doc(duration, voice=False):
 
 
 class FakeMsg:
-    def __init__(self, msg_id, media=None):
+    def __init__(self, msg_id, media=None, file=None):
         self.id = msg_id
         self.media = media
         self.audio = media if (media and not getattr(media, "voice", False)) else None
         self.voice = media if (media and getattr(media, "voice", False)) else None
+        self.file = file  # mirrors the real Telethon MessageFile helper
 
 
 class TestAudioDuration(unittest.TestCase):
@@ -260,6 +262,101 @@ class TestDedupe(unittest.TestCase):
         remember_sent(state, "melody9#42")
         reloaded = json.loads(json.dumps(state))
         self.assertTrue(already_sent(reloaded, "melody9#42"))
+
+
+class TestFileDedupe(unittest.TestCase):
+    """A song reposted by ANOTHER channel is a new message id — the id key alone
+    lets it through. The file-name key is what catches the repost."""
+
+    def _msg(self, msg_id, name):
+        return FakeMsg(msg_id, fake_audio_doc(1200),
+                       file=SimpleNamespace(name=name))
+
+    def test_name_key_normalizes_case_spacing_and_extension_gap(self):
+        from bot import name_key
+        self.assertEqual(name_key("Track One.MP3"), name_key("track one .mp3"))
+        self.assertEqual(name_key("Track One.MP3"), name_key("TrackOne.mp3"))
+        self.assertTrue(name_key("x.mp3").startswith("f:"))
+
+    def test_name_key_cannot_collide_with_a_media_key(self):
+        from bot import name_key
+        self.assertNotEqual(name_key("melody9#42"), "melody9#42")
+
+    def test_cross_channel_repost_is_a_name_dup(self):
+        from bot import filename_of, name_key
+        state = {"channels": {}}
+        remember_sent(state, name_key("Track One.mp3"))  # melody9 posted it
+        repost = self._msg(777, "Track One.MP3")         # icyRemix reposted it
+        self.assertFalse(already_sent(state, media_key("icyRemix", repost)))
+        self.assertTrue(already_sent(state, name_key(filename_of(repost))))
+
+    def test_file_without_a_name_falls_back_to_the_media_key(self):
+        from bot import filename_of
+        # no .file attribute at all and .file.name=None both give ""
+        self.assertEqual(filename_of(FakeMsg(1, fake_audio_doc(1200))), "")
+        self.assertEqual(
+            filename_of(FakeMsg(2, fake_audio_doc(1200), file=SimpleNamespace(name=None))), "")
+
+    def test_empty_name_is_never_recorded_as_a_key(self):
+        # "f:" alone (from an empty name) must never poison the sent table.
+        from bot import name_key
+        state = {"channels": {}}
+        fname = ""
+        if fname:  # the exact guard shape used in both send loops
+            remember_sent(state, name_key(fname))
+        self.assertFalse(state.get("sent"))
+
+    def test_cron_loop_checks_and_records_the_name_key(self):
+        body = inspect.getsource(bot)[inspect.getsource(bot).index("async def main"):]
+        self.assertEqual(body.count("if id_dup or name_dup:"), 1)          # cron check
+        self.assertEqual(body.count('fname and already_sent(state, name_key(fname))'), 1)  # backfill check
+        self.assertEqual(body.count("if fname:"), 2)                       # remember in both loops
+
+    def test_dupes_are_counted_and_reported(self):
+        body = inspect.getsource(bot)[inspect.getsource(bot).index("async def main"):]
+        self.assertIn("dupes += 1", body)
+        self.assertIn("dupes={dupes}", body)
+
+    def test_seed_runs_once_before_any_forwarding(self):
+        src = inspect.getsource(bot)
+        i_seed = src.index("await seed_sent_names(client, target, state)")
+        i_loop = src.index("for handle, name in load_channels():")
+        # seed only when there is nothing to seed from (no f: keys yet)
+        self.assertIn('any(k.startswith("f:") for k in sent)', src)
+
+
+class TestSeed(unittest.IsolatedAsyncioTestCase):
+    """Sweep what the archive already holds one time, or every pre-change file
+    would forward again once."""
+
+    class FakeC:
+        def __init__(self, msgs):
+            self._msgs = msgs
+            self.hint = None
+
+        async def iter_messages(self, target, limit=None):
+            for m in self._msgs:
+                yield m
+
+    def _named(self, i):
+        return FakeMsg(i, fake_audio_doc(1200),
+                       file=SimpleNamespace(name=f"Song{i}.mp3"))
+
+    async def test_seeds_named_files_and_is_one_shot(self):
+        from bot import seed_sent_names, name_key, already_sent
+        msgs = [self._named(i) for i in range(1, 4)] + [FakeMsg(4, fake_audio_doc(1200))]
+        client = self.FakeC(msgs)
+        state = {"channels": {}}
+        self.assertEqual(await seed_sent_names(client, "arch", state), 3)  # unnamed skipped
+        self.assertTrue(already_sent(state, name_key("song1.MP3")))
+        # second sweep is a no-op once f: keys exist
+        self.assertEqual(await seed_sent_names(client, "arch", state), 0)
+
+    async def test_missing_sent_table_is_created(self):
+        from bot import seed_sent_names
+        state = {"channels": {}}
+        await seed_sent_names(self.FakeC([]), "arch", state)
+        self.assertIn("sent", state)
 
 
 class TestCursor(unittest.TestCase):
