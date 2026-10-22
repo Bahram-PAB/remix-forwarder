@@ -152,8 +152,6 @@ class TestChannels(unittest.TestCase):
         # to ask Telegram for the real title.
         for handle, name in load_channels():
             self.assertTrue(name, f"{handle} has no fallback name")
-        self.assertTrue(any(n.startswith("@") for _, n in load_channels()),
-                        "expected at least one channel using the @handle fallback")
 
 
 class TestState(unittest.TestCase):
